@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-cn">
+<head>
+    <meta charset="UTF-8">
+    <title>明日方舟抽卡概率计算器</title>
+    <style>
+        body { font-family: "Segoe UI", sans-serif; background:#f5f7fa; margin:0; padding:24px; color:#1f2933; }
+        h1 { font-size:24px; margin-bottom:16px; }
+        .card { background:#fff; border-radius:12px; padding:20px; max-width:640px; margin:auto; box-shadow:0 12px 24px rgba(15,23,42,0.08); }
+        label { display:block; margin-bottom:8px; font-weight:600; }
+        input[type="number"], input[type="text"], select {
+            width:100%; padding:10px 12px; margin-bottom:16px; border:1px solid #d0d7de;
+            border-radius:8px; font-size:14px; box-sizing:border-box;
+        }
+        button {
+            background:#2563eb; color:#fff; border:none; border-radius:8px;
+            padding:10px 18px; font-size:14px; cursor:pointer; transition:.2s;
+        }
+        button:hover { background:#1d4ed8; }
+        .result { margin-top:24px; padding:16px; background:#eff6ff; border-radius:8px; line-height:1.8; }
+        .flex { display:flex; gap:12px; }
+        .flex > div { flex:1; }
+        .hint { font-size:12px; color:#64748b; margin-top:-10px; margin-bottom:16px; }
+        table { width:100%; border-collapse:collapse; margin-top:12px; }
+        th, td { padding:8px; border-bottom:1px solid #e2e8f0; text-align:left; font-size:14px; }
+        .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#e0f2fe; color:#0369a1; font-size:12px; margin-left:6px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>明日方舟抽卡概率计算器</h1>
+
+        <label for="experimentCount">抽卡次数</label>
+        <input id="experimentCount" type="number" min="0" max="10000" value="10">
+
+        <label for="experimentSelect">卡池类型</label>
+        <select id="experimentSelect"></select>
+
+        <div class="hint">可自定义卡池类型：填写名称与概率后点击“添加卡池类型”。</div>
+        <div class="flex">
+            <div>
+                <input id="customName" type="text" placeholder="自定义卡池名称">
+            </div>
+            <div>
+                <input id="customGood" type="number" min="0" max="1" step="0.01" placeholder="好情况概率 (0-1)">
+            </div>
+            <div>
+                <input id="customExtreme" type="number" min="0" max="1" step="0.01" placeholder="极好概率 (0-1)">
+            </div>
+        </div>
+        <button id="addExperiment">添加卡池类型</button>
+
+        <div style="margin-top:20px;">
+            <button id="runButton">开始计算</button>
+        </div>
+
+        <div id="result" class="result" style="display:none;">
+            <strong>结果</strong>
+            <table>
+                <tbody>
+                    <tr><th>抽出六星概率</th><td id="probSuccess">0%</td></tr>
+                    <tr><th>抽出六星且为当期up概率</th><td id="probGood">0%</td></tr>
+                    <tr><th>抽出六星且为当期up中期望干员概率</th><td id="probExtreme">0%</td></tr>
+                    <tr><th>抽出六星且同时获得两位当期up干员概率</th><td id="probExtremeSub">0%</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        const BIT_SUCCESS = 1 << 0;
+        const BIT_GOOD = 1 << 1;
+        const BIT_EXTREME = 1 << 2;
+        const BIT_SUBGOOD = 1 << 3;
+
+        const experiments = [
+            { name: "常规双up池", description: "当期up 50%，期望干员占当期up 50%", goodProb: 0.5, extremeProb: 0.5 },
+            { name: "限定双up池", description: "当期up 70%，期望干员占当期up 50%", goodProb: 0.7, extremeProb: 0.5 },
+            { name: "单up池", description: "当期up 50%，期望干员占当期up 100%", goodProb: 0.5, extremeProb: 1.0 }
+        ];
+
+        const experimentSelect = document.getElementById("experimentSelect");
+        const runButton = document.getElementById("runButton");
+        const addButton = document.getElementById("addExperiment");
+
+        function refreshOptions() {
+            experimentSelect.innerHTML = "";
+            experiments.forEach((exp, index) => {
+                const option = document.createElement("option");
+                option.value = index;
+                option.textContent = `${exp.name} (${exp.description})`;
+                experimentSelect.appendChild(option);
+            });
+        }
+
+        function clamp01(v) {
+            if (v < 0) return 0;
+            if (v > 1) return 1;
+            return v;
+        }
+
+        function successProb(failCount) {
+            const p = failCount > 50 ? 0.02 * failCount - 0.98 : 0.02;
+            return p > 1 ? 1 : p;
+        }
+
+        function applySuccess(mass, mask, config, dpNext) {
+            const successMask = mask | BIT_SUCCESS;
+            const goodProb = clamp01(config.goodProb);
+            const extremeProb = clamp01(config.extremeProb);
+
+            const goodMass = mass * goodProb;
+            const badMass = mass - goodMass;
+
+            if (badMass > 0) {
+                dpNext[0][successMask] += badMass;
+            }
+            if (goodMass <= 0) return;
+
+            const goodMask = successMask | BIT_GOOD;
+            const extremeMass = goodMass * extremeProb;
+            const subMass = goodMass - extremeMass;
+
+            if (extremeMass > 0) {
+                dpNext[0][goodMask | BIT_EXTREME] += extremeMass;
+            }
+            if (subMass > 0) {
+                dpNext[0][goodMask | BIT_SUBGOOD] += subMass;
+            }
+        }
+
+        function compute(n, config) {
+            const size = n + 1;
+            let dpCurr = Array.from({ length: size }, () => new Float64Array(16));
+            let dpNext = Array.from({ length: size }, () => new Float64Array(16));
+            dpCurr[0][0] = 1;
+
+            for (let iter = 0; iter < n; iter++) {
+                dpNext.forEach(row => row.fill(0));
+                for (let fail = 0; fail <= n; fail++) {
+                    const p = successProb(fail);
+                    const row = dpCurr[fail];
+                    for (let mask = 0; mask < 16; mask++) {
+                        const cur = row[mask];
+                        if (cur === 0) continue;
+
+                        const successMass = cur * p;
+                        if (successMass > 0) {
+                            applySuccess(successMass, mask, config, dpNext);
+                        }
+
+                        const failMass = cur * (1 - p);
+                        if (failMass > 0) {
+                            const nextFail = fail + 1 > n ? n : fail + 1;
+                            dpNext[nextFail][mask] += failMass;
+                        }
+                    }
+                }
+                const temp = dpCurr;
+                dpCurr = dpNext;
+                dpNext = temp;
+            }
+
+            let probSuccess = 0;
+            let probGood = 0;
+            let probExtreme = 0;
+            let probExtremeAndSub = 0;
+
+            for (let fail = 0; fail <= n; fail++) {
+                for (let mask = 0; mask < 16; mask++) {
+                    const val = dpCurr[fail][mask];
+                    if (val === 0) continue;
+
+                    const hasSuccess = mask & BIT_SUCCESS;
+                    const hasGood = mask & BIT_GOOD;
+                    const hasExtreme = mask & BIT_EXTREME;
+                    const hasSub = mask & BIT_SUBGOOD;
+
+                    if (hasSuccess) probSuccess += val;
+                    if (hasSuccess && hasGood) probGood += val;
+                    if (hasSuccess && hasExtreme) probExtreme += val;
+                    if (hasSuccess && hasExtreme && hasSub) probExtremeAndSub += val;
+                }
+            }
+
+            return {
+                probSuccess,
+                probGood,
+                probExtreme,
+                probExtremeAndSub
+            };
+        }
+
+        function renderResult(result) {
+            document.getElementById("probSuccess").textContent = (result.probSuccess * 100).toFixed(2) + "%";
+            document.getElementById("probGood").textContent = (result.probGood * 100).toFixed(2) + "%";
+            document.getElementById("probExtreme").textContent = (result.probExtreme * 100).toFixed(2) + "%";
+            document.getElementById("probExtremeSub").textContent = (result.probExtremeAndSub * 100).toFixed(2) + "%";
+            document.getElementById("result").style.display = "block";
+        }
+
+        runButton.addEventListener("click", () => {
+            const n = Number(document.getElementById("experimentCount").value);
+            const index = Number(experimentSelect.value);
+            if (!Number.isInteger(n) || n < 0 || n > 10000 || Number.isNaN(index)) {
+                alert("请检查输入。");
+                return;
+            }
+            const config = experiments[index];
+            const result = compute(n, config);
+            renderResult(result);
+        });
+
+        addButton.addEventListener("click", () => {
+            const name = document.getElementById("customName").value.trim();
+            const good = Number(document.getElementById("customGood").value);
+            const extreme = Number(document.getElementById("customExtreme").value);
+
+            if (!name) {
+                alert("请输入卡池名称。");
+                return;
+            }
+            if (Number.isNaN(good) || Number.isNaN(extreme) || good < 0 || good > 1 || extreme < 0 || extreme > 1) {
+                alert("请输入 0-1 范围内的概率。");
+                return;
+            }
+
+            experiments.push({
+                name,
+                description: `当期up ${Math.round(good * 100)}%，期望干员占当期up ${Math.round(extreme * 100)}%`,
+                goodProb: good,
+                extremeProb: extreme
+            });
+            refreshOptions();
+            experimentSelect.value = experiments.length - 1;
+            document.getElementById("customName").value = "";
+            document.getElementById("customGood").value = "";
+            document.getElementById("customExtreme").value = "";
+        });
+
+        refreshOptions();
+    </script>
+</body>
+</html>
